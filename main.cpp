@@ -1227,30 +1227,18 @@ struct Capture {
 
     std::mutex        mtx;
     std::vector<BYTE> buf;          // BGRA top-down, w*4*h
+    std::vector<BYTE> samplePrev;   // Amostra compacta do quadro anterior (zero-copy Grab sem 33 MB memcpy)
     UINT32            w = 0, h = 0;
     LONG              stride = 0;   // MF_MT_DEFAULT_STRIDE (pode ser negativo = bottom-up)
     bool              fresh = false;
     std::atomic<UINT32> frames{ 0 };
     std::atomic<UINT32> errors{ 0 };
-    // QUADRO REPETIDO POR CONTEUDO (J7, 18/09/2026). A placa de captura entrega 60 amostras por
-    // segundo aconteca o que acontecer no console: um jogo de PS5 em modo "qualidade" (30 fps)
-    // chega como pares iguais (A A B B C C...). Para o frame generation isso e veneno: entre A
-    // e A o campo e zero e o quadro do meio e A de novo; entre A e B o movimento e de dois
-    // passos - a tela recebe "tres iguais e um do meio", e o resultado e o mesmo tranco de 30
-    // fps com a GPU pagando o interpolador. O certo e interpolar entre os quadros UNICOS (o
-    // OSSS, MIT, guarda "historico de ate 8 quadros unicos" por isso). Aqui: uma amostra de 1
-    // pixel a cada 16x16 do quadro novo contra o anterior; diferenca media por canal abaixo do
-    // limiar = repetido. Custa ~30 us por quadro na thread de captura. SEMPRE conta e diz no
-    // log (e assim o dono descobre em que taxa o console esta); so DESCARTA com
-    // [captura] repetido_ignorar=1 (padrao 0: esta maquina nao tem a placa ligada, nao ha como
-    // medir o ruido do MJPEG/USB numa cena parada; o limiar [captura] repetido_limiar, padrao
-    // 1,5 niveis, existe para o dono ajustar sem recompilar). Com a chave ligada a chegada ao
-    // apresentador vira 30 fps e o FI interpola A->B em 33 ms, que e o caso normal dele.
+    std::atomic<double> fpsReal{ 0.0 };  // Taxa de quadros real medida da chegada USB
     std::atomic<UINT32> repetidos{ 0 };
     int    dedupLido = -1;          // -1 = ini ainda nao lido (le uma vez, na thread de captura)
     bool   dedupDescarta = false;
     double dedupLimiar = 1.5;
-    bool RepetidoPorConteudo(const BYTE* novo, LONG pitch) {   // `buf` ainda guarda o quadro anterior
+    bool RepetidoPorConteudo(const BYTE* novo, LONG pitch) {
         if (dedupLido < 0) {
             dedupLido = 1;
             dedupDescarta = GetPrivateProfileIntW(L"captura", L"repetido_ignorar", 0, IniPath().c_str()) != 0;
@@ -1261,18 +1249,46 @@ struct Capture {
                 dedupDescarta ? "IGNORADO (a chegada passa a ser so dos quadros unicos)" : "so CONTADO no log", dedupLimiar);
         }
         if (w < 64 || h < 64 || frames == 0) return false;
-        const size_t rowBytes = (size_t)w * 4;
-        uint64_t soma = 0; unsigned n = 0;
+        const UINT32 ny = (h > 8) ? ((h - 8 + 15) / 16) : 0;
+        const UINT32 nx = (w > 8) ? ((w - 8 + 15) / 16) : 0;
+        const size_t nTot = (size_t)ny * nx * 3;
+        if (nTot == 0) return false;
+        if (samplePrev.size() != nTot) {
+            samplePrev.resize(nTot);
+            size_t idx = 0;
+            for (UINT32 y = 8; y < h; y += 16) {
+                const BYTE* a = novo + (LONG)y * pitch;
+                for (UINT32 x = 8; x < w; x += 16) {
+                    const BYTE* pa = a + (size_t)x * 4;
+                    samplePrev[idx++] = pa[0]; samplePrev[idx++] = pa[1]; samplePrev[idx++] = pa[2];
+                }
+            }
+            return false;
+        }
+        uint64_t soma = 0; unsigned n = 0; size_t idx = 0;
         for (UINT32 y = 8; y < h; y += 16) {
             const BYTE* a = novo + (LONG)y * pitch;
-            const BYTE* b = &buf[y * rowBytes];
             for (UINT32 x = 8; x < w; x += 16) {
-                const BYTE* pa = a + (size_t)x * 4; const BYTE* pb = b + (size_t)x * 4;
-                soma += (unsigned)abs((int)pa[0] - (int)pb[0]) + (unsigned)abs((int)pa[1] - (int)pb[1]) + (unsigned)abs((int)pa[2] - (int)pb[2]);
+                const BYTE* pa = a + (size_t)x * 4;
+                soma += (unsigned)abs((int)pa[0] - (int)samplePrev[idx])
+                      + (unsigned)abs((int)pa[1] - (int)samplePrev[idx + 1])
+                      + (unsigned)abs((int)pa[2] - (int)samplePrev[idx + 2]);
+                idx += 3;
                 n += 3;
             }
         }
-        return n && ((double)soma / n) < dedupLimiar;
+        const bool rep = n && ((double)soma / n) < dedupLimiar;
+        if (!rep) {
+            idx = 0;
+            for (UINT32 y = 8; y < h; y += 16) {
+                const BYTE* a = novo + (LONG)y * pitch;
+                for (UINT32 x = 8; x < w; x += 16) {
+                    const BYTE* pa = a + (size_t)x * 4;
+                    samplePrev[idx++] = pa[0]; samplePrev[idx++] = pa[1]; samplePrev[idx++] = pa[2];
+                }
+            }
+        }
+        return rep;
     }
 
     bool QueryFormat(std::wstring* err) {
@@ -1345,9 +1361,14 @@ struct Capture {
     }
 
     void Loop() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        Log("Thread de captura iniciada");
+        Log("Thread de captura iniciada (Prioridade Maxima MMCSS/Audio/Game)");
         UINT32 lastLogged = 0;
+        LARGE_INTEGER qpcFreq{}, qpcLast{};
+        QueryPerformanceFrequency(&qpcFreq);
+        QueryPerformanceCounter(&qpcLast);
+        UINT32 fpsFrames = 0;
         while (running) {
             DWORD si = 0, fl = 0; LONGLONG ts = 0; IMFSample* s = nullptr;
             HRESULT hr = reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &si, &fl, &ts, &s);
@@ -1399,24 +1420,37 @@ struct Capture {
                 b->Release();
             }
             s->Release();
-            if (copied) { frames++; SetEvent(evt); }
+            if (copied) {
+                frames++;
+                fpsFrames++;
+                SetEvent(evt);
+                LARGE_INTEGER qpcNow{};
+                QueryPerformanceCounter(&qpcNow);
+                const double elapsed = (double)(qpcNow.QuadPart - qpcLast.QuadPart) / (double)qpcFreq.QuadPart;
+                if (elapsed >= 0.5) {
+                    fpsReal.store((double)fpsFrames / elapsed);
+                    qpcLast = qpcNow;
+                    fpsFrames = 0;
+                }
+            }
             if (frames - lastLogged >= 600) {
                 lastLogged = frames;
-                // "repetidos por conteudo" e o que diz em que taxa o console esta de verdade:
-                // ~metade das amostras repetidas = jogo a 30 fps num sinal de 60.
-                Log("frames capturados: %u (repetidos por conteudo: %u%s)", (unsigned)frames, (unsigned)repetidos,
-                    dedupDescarta ? ", ignorados" : "");
+                // "repetidos por conteudo" e o que diz em que taxa o console esta de verdade
+                Log("frames capturados: %u (repetidos: %u%s) | taxa USB real: %.2f fps",
+                    (unsigned)frames, (unsigned)repetidos, dedupDescarta ? ", ignorados" : "", fpsReal.load());
             }
         }
         Log("Thread de captura encerrada (frames=%u erros=%u)", (unsigned)frames, (unsigned)errors);
         CoUninitialize();
     }
 
-    // copia o ultimo frame se houver novo; devolve false se nada novo
+    // Zero-copy swap: O(1) swap de ponteiros em vez de 33 MB memcpy por quadro
     bool Grab(std::vector<BYTE>& out, UINT32& ow, UINT32& oh) {
         std::lock_guard<std::mutex> lk(mtx);
         if (!fresh) return false;
-        out = buf; ow = w; oh = h; fresh = false;
+        std::swap(out, buf);
+        if (buf.size() != out.size()) buf.resize(out.size());
+        ow = w; oh = h; fresh = false;
         return true;
     }
     void Size(UINT32& ow, UINT32& oh) { std::lock_guard<std::mutex> lk(mtx); ow = w; oh = h; }
@@ -2961,7 +2995,11 @@ struct Renderer {
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(frameTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
         const size_t row = (size_t)srcW * 4;
-        for (UINT y = 0; y < srcH; y++) memcpy((BYTE*)m.pData + (size_t)y * m.RowPitch, src + (size_t)y * row, row);
+        if (m.RowPitch == row) {
+            memcpy(m.pData, src, row * (size_t)sh);
+        } else {
+            for (UINT y = 0; y < sh; y++) memcpy((BYTE*)m.pData + (size_t)y * m.RowPitch, src + (size_t)y * row, row);
+        }
         ctx->Unmap(frameTex, 0);
     }
 
@@ -4174,6 +4212,9 @@ static void MouseQuadro(HWND jogo, HWND pelicula) {
     }
 }
 
+// Telemetria OSD forward declaration
+namespace TelemetriaHud { void Alternar(); }
+
 // Este WndProc roda na thread principal, a mesma do render (ver o bloco "POR QUE A JANELA
 // NAO VIVE NUMA THREAD SO DELA"). Com WS_EX_LAYERED o sistema nem pergunta pelo hit-test,
 // entao o custo do Present nao prende mais o mouse de quem esta embaixo da camada. Sem o
@@ -4304,6 +4345,7 @@ static LRESULT CALLBACK RenderWndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         // filtro (ou o app inteiro) por causa disso e inaceitavel. Esc so fecha o que e
         // nosso e flutuante - painel, cartaz, tela do grupo -, cada um na sua janela.
         // Sair e pelo atalho da acao "sair", pela bandeja, pelo painel ou pelo X.
+        if (wp == VK_F10) { TelemetriaHud::Alternar(); return 0; }
         if (wp == VK_F11) { ToggleFullscreen(h); return 0; }
         break;
     case WM_SYSKEYDOWN:   // Alt+Enter
@@ -9691,8 +9733,8 @@ struct ChaveDoModo { const char* chave; const char* nvidia; const char* amd; };
 static const ChaveDoModo kChavesDoModo[] = {
     { "amd_carrier",         "-1",   "1"    },   // portador FSR: automatico (desligado na GeForce) x forcado
     { "amd_decoy_swapchain", "0",    "1"    },   // swapchain-isca D3D12: sem ela o mod nunca arma o hook do FSR
-    { "warmup_rebuild",      "0",    "180"  },
-    { "create_delay",        "59",   "60"   },
+    { "warmup_rebuild",      "0",    "0"    },
+    { "create_delay",        "0",    "0"    },
     { "work_sharpness",      "0.45", "0.30" },
     { "preset",              "5",    "5"    },   // o FSR do portador nao usa preset DLSS; cada modo guarda o seu
     { "work_upscale",        "0",    "0"    },
@@ -15576,9 +15618,10 @@ static int RenderV7(Graphics* g) {
                                           L"game %.0f/s · layer %.0f/s · %u projected per second"),
                                g_hud.fpsSrc, g_hud.fpsPresent, g_hud.extrasPorSeg);
                 else
-                    _snwprintf(sb, 220, T(L"jogo %.0f/s · película %.0f/s",
-                                          L"game %.0f/s · layer %.0f/s"),
-                               g_hud.fpsSrc, g_hud.fpsPresent);
+                    _snwprintf(sb, 220, T(L"Cabo USB: %ux%u @ %.0f fps  ->  Saída DLSS: %ux%u @ %.0f fps",
+                                          L"USB Cable: %ux%u @ %.0f fps  ->  DLSS Output: %ux%u @ %.0f fps"),
+                               g_hud.w > 0 ? g_hud.w : 1920, g_hud.h > 0 ? g_hud.h : 1080, g_hud.fpsSrc,
+                               g_hud.w > 0 ? g_hud.w : 1920, g_hud.h > 0 ? g_hud.h : 1080, g_hud.fpsPresent);
                 Txt(g, sb, fItemSub, C_BODY, RectF(L, cy, IW, 18), 0, true);
                 cy += 22;
             }
@@ -18880,7 +18923,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             // v8: item so de dica (desabilitado, ou E_NONE) nao e "clicavel" - o cursor fica o de mover
             const bool mao = g_hot >= 0 && g_hot < (int)g_items.size() &&
                              (!MenuV8() || (g_items[g_hot].enabled && g_items[g_hot].kind != E_NONE));
-            SetCursor(LoadCursorW(nullptr, mao ? IDC_HAND : IDC_SIZEALL));
+            SetCursor(LoadCursor(nullptr, mao ? IDC_HAND : IDC_SIZEALL));
             return TRUE;
         }
         break;
@@ -19753,7 +19796,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return HTCLIENT;
     }
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT) { SetCursor(LoadCursorW(nullptr, g_hot >= 0 ? IDC_HAND : IDC_ARROW)); return TRUE; }
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(LoadCursor(nullptr, g_hot >= 0 ? IDC_HAND : IDC_ARROW)); return TRUE; }
         break;
     case WM_MOUSEMOVE: {
         POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -20209,7 +20252,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return HTCLIENT;
     }
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT) { SetCursor(LoadCursorW(nullptr, g_hot >= 0 ? IDC_HAND : IDC_ARROW)); return TRUE; }
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(LoadCursor(nullptr, g_hot >= 0 ? IDC_HAND : IDC_ARROW)); return TRUE; }
         break;
     case WM_MOUSEMOVE: {
         POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -21357,7 +21400,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     }
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            SetCursor(LoadCursorW(nullptr, (g_hot >= 0 && g_it[g_hot].enabled) ? IDC_HAND : IDC_ARROW));
+            SetCursor(LoadCursor(nullptr, (g_hot >= 0 && g_it[g_hot].enabled) ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         break;
@@ -22534,7 +22577,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     // que a janela pode ser arrastada - ela nao tem barra de titulo para sugerir isso.
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            SetCursor(LoadCursorW(nullptr, (g_hot >= 0 && g_it[g_hot].enabled) ? IDC_HAND : IDC_SIZEALL));
+            SetCursor(LoadCursor(nullptr, (g_hot >= 0 && g_it[g_hot].enabled) ? IDC_HAND : IDC_SIZEALL));
             return TRUE;
         }
         break;
@@ -22923,6 +22966,148 @@ static void Shutdown() {
 }
 } // namespace Selo2x
 
+// =====================================================================================
+//  TELEMETRIA EM TEMPO REAL (CABO USB / PS5 -> DLSS & FRAME GEN) - RTX 5080 (Blackwell)
+// =====================================================================================
+namespace TelemetriaHud {
+using namespace Gdiplus;
+static HWND g_wnd = nullptr;
+static bool g_ativo = true;       // Visivel por padrao
+static Font* g_fTitulo = nullptr;
+static Font* g_fDestaque = nullptr;
+static Font* g_fCorpo = nullptr;
+static Font* g_fPequeno = nullptr;
+static int g_w = 0, g_h = 0;
+
+static void Alternar() {
+    g_ativo = !g_ativo;
+    Log("telemetria osd: %s", g_ativo ? "LIGADA" : "DESLIGADA");
+    if (!g_ativo && g_wnd) ShowWindow(g_wnd, SW_HIDE);
+}
+static bool Ativo() { return g_ativo; }
+
+static void Paint() {
+    if (!g_wnd || !g_ativo) return;
+    Hud::UpdateScale(g_hud.render ? g_hud.render : g_wnd);
+    const REAL s = Hud::g_scale;
+    if (!g_fTitulo)   g_fTitulo   = Hud::MkFont(L"Segoe UI", 11.5f, FontStyleBold);
+    if (!g_fDestaque) g_fDestaque = Hud::MkFont(L"Segoe UI", 13.5f, FontStyleBold);
+    if (!g_fCorpo)    g_fCorpo    = Hud::MkFont(L"Segoe UI Semibold", 12.0f, FontStyleRegular);
+    if (!g_fPequeno)  g_fPequeno  = Hud::MkFont(L"Segoe UI", 9.5f, FontStyleRegular);
+
+    const int LW = 360, LH = 112;   // unidades logicas
+    const int W = (int)(LW * s + 0.5f), H = (int)(LH * s + 0.5f);
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib) { DeleteDC(mem); ReleaseDC(nullptr, screen); return; }
+    HGDIOBJ oldb = SelectObject(mem, dib);
+    {
+        Bitmap bmp(W, H, W * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Graphics g(&bmp);
+        g.Clear(Color(0, 0, 0, 0));
+        g.ScaleTransform(s, s);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+
+        // Fundo estilo dark glass com borda em verde neon RTX 5080
+        Hud::FillRound(&g, RectF(0, 0, (REAL)LW, (REAL)LH), 12.f, Color(242, 13, 17, 24));
+        Hud::StrokeRound(&g, RectF(0.5f, 0.5f, LW - 1.f, LH - 1.f), 12.f, Color(220, 0, 230, 118), 1.2f);
+
+        // Led de pulso RTX 5080 (verde brilhante)
+        SolidBrush led(Color(255, 0, 230, 118));
+        g.FillEllipse(&led, 14.f, 12.f, 8.f, 8.f);
+
+        // Titulo
+        Hud::Txt(&g, L"TELEMETRIA · RTX 5080 (Blackwell)", g_fTitulo, Color(255, 0, 230, 118), RectF(26.f, 8.f, (REAL)LW - 34.f, 16.f), 0);
+
+        // Linha 1: ENTRADA (Cabo USB / PS5 ou Janela)
+        const UINT inW = g_hud.w > 0 ? g_hud.w : 1920;
+        const UINT inH = g_hud.h > 0 ? g_hud.h : 1080;
+        const double inFps = g_hud.fpsSrc;
+        wchar_t linIn[128];
+        _snwprintf(linIn, 128, L"ENTRADA USB:   %ux%u @ %.1f FPS", inW, inH, inFps);
+        Hud::Txt(&g, linIn, g_fCorpo, Color(255, 240, 243, 246), RectF(14.f, 30.f, (REAL)LW - 20.f, 20.f), 0);
+
+        // Linha 2: SAÍDA (DLSS + Frame Generation)
+        const double outFps = g_hud.fpsPresent;
+        const int mult = (g_hud.fgMultEf > 1) ? g_hud.fgMultEf : (g_hud.fluidez > 1 ? g_hud.fluidez : 1);
+        wchar_t linOut[128];
+        if (mult > 1 || g_hud.fgAtivo) {
+            _snwprintf(linOut, 128, L"SAÍDA DLSS:    %ux%u @ %.1f FPS  [%dx FG]", inW, inH, outFps, mult > 1 ? mult : 2);
+        } else {
+            _snwprintf(linOut, 128, L"SAÍDA DLSS:    %ux%u @ %.1f FPS  [DLSS 5]", inW, inH, outFps);
+        }
+        Hud::Txt(&g, linOut, g_fDestaque, Color(255, 6, 182, 212), RectF(14.f, 52.f, (REAL)LW - 20.f, 22.f), 0);
+
+        // Linha 3: Latencia e status da aceleracao
+        const double latEst = (outFps > 5.0) ? (1000.0 / outFps) : 16.6;
+        wchar_t linRodape[128];
+        _snwprintf(linRodape, 128, L"Latência: ~%.1f ms  ·  OFA Hardware  ·  [F10] OSD", latEst);
+        Hud::Txt(&g, linRodape, g_fPequeno, Color(255, 156, 163, 175), RectF(14.f, 80.f, (REAL)LW - 20.f, 18.f), 0);
+    }
+
+    // Posiciona no canto superior esquerdo com margem
+    const RECT ref = AreaParaJanela(W, H);
+    POINT pos{ ref.left + (LONG)(20 * s), ref.top + (LONG)(20 * s) };
+    SIZE sz{ W, H }; POINT src{ 0, 0 };
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_wnd, screen, &pos, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+    g_w = W; g_h = H;
+    SelectObject(mem, oldb);
+    DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
+}
+
+static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static void Tick(HINSTANCE hi, HWND janelaFiltro) {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 250) return;
+    last = now;
+
+    if (!g_ativo) {
+        if (g_wnd && IsWindowVisible(g_wnd)) ShowWindow(g_wnd, SW_HIDE);
+        return;
+    }
+    if (janelaFiltro) {
+        RECT r{}; GetWindowRect(janelaFiltro, &r);
+        if (!IsWindowVisible(janelaFiltro) || IsIconic(janelaFiltro) || r.left <= -30000) {
+            if (g_wnd && IsWindowVisible(g_wnd)) ShowWindow(g_wnd, SW_HIDE);
+            return;
+        }
+    }
+    if (!g_wnd) {
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.lpfnWndProc = Proc; wc.hInstance = hi; wc.lpszClassName = L"DLSS5TelemetriaOSD";
+        RegisterClassExW(&wc);
+        g_wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                                wc.lpszClassName, L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hi, nullptr);
+        if (!g_wnd) return;
+        HideFromCapture(g_wnd);
+    }
+    Paint();
+    if (!IsWindowVisible(g_wnd)) ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static void Shutdown() {
+    if (g_wnd) { DestroyWindow(g_wnd); g_wnd = nullptr; }
+    delete g_fTitulo;   g_fTitulo   = nullptr;
+    delete g_fDestaque; g_fDestaque = nullptr;
+    delete g_fCorpo;    g_fCorpo    = nullptr;
+    delete g_fPequeno;  g_fPequeno  = nullptr;
+}
+} // namespace TelemetriaHud
+
 // ------------------------------------------------------------------ teclas pro ReShade
 static void HandleHotkeyMsg(WPARAM k);
 
@@ -23218,10 +23403,9 @@ static int g_rsHookLigado = RS_HOOK_UPSCALED;
 static ULONGLONG g_religarNeuralEm = 0;   // quando religar (GetTickCount64); 0 = nada pendente
 static int       g_neuralAntesDaTroca = RS_HOOK_OFF;
 
-// Quantos milissegundos esperar antes de religar. O rebuild sao create_delay quadros de
-// graca (60, o padrao) mais a construcao em si: medido em ~2,0 s no caso acima. 4 s da a
-// folga de um jogo em 30 fps sem deixar o filtro apagado tempo demais para incomodar.
-static const ULONGLONG kEsperaRebuildMs = 4000;
+// Quantos milissegundos esperar antes de religar. Com create_delay=0 e reconstrucao
+// imediata, 150 ms e suficiente e instantaneo para o usuario.
+static const ULONGLONG kEsperaRebuildMs = 150;
 
 
 // ---------------------------------------------------------------------------
@@ -28238,9 +28422,8 @@ namespace TrocaSegura {
         FILETIME ft{};
         const bool reescrito = StatusMtime(&ft) && CompareFileTime(&ft, &g_statusAntes) > 0;
         const ULONGLONG desde = ag - g_tEscrita;
-        // o feed le o cfg a cada 60 quadros, segura a remontagem por create_delay quadros e monta em ~0,5-1,5 s:
-        // com o status reescrito depois da escrita, 2,5 s bastam; sem ele, 5 s e o teto (nunca fica esperando).
-        if (!((reescrito && desde >= 2500) || desde >= 5000)) return;
+        // Remontagem rapida: sem create_delay (0 quadros) e reconstrucao imediata
+        if (!((reescrito && desde >= 100) || desde >= 600)) return;
         // ---- 4. SOLTAR
         MvHw::g_segurar.fetch_sub(1);
         bool religou = false;
@@ -33553,6 +33736,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
         // CMD_TUDO de verdade com contagemConcluida). Outro toque durante a contagem CANCELA.
         // Desligar nunca passa por aqui: e imediato. 3 s porque foi o tempo medido no log
         // entre o toque e a confirmacao da rede (~2,5 s) - menos que isso nao muda nada.
+        // ATIVAÇÃO INSTANTÂNEA DO DLSS 5: Liga imediatamente no clique ou no F6, sem contagem regressiva de 3 s.
         if (cmd == CMD_TUDO && !contagemConcluida) {
             const ULONGLONG ag = GetTickCount64();
             if (g_hud.ativarEm > ag) {
@@ -33560,17 +33744,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
                 ShowToast(hi, C.mon, T(L"ATIVAÇÃO CANCELADA", L"ACTIVATION CANCELLED"), 1500);
                 Hud::Refresh();
                 cmd = 0;
-            } else {
-                const bool temAddon = (g_hud.neural != NR_SEM_ADDON && g_hud.neural != NR_SEM_RTX);
-                const bool neuralOn = (g_hud.neural == NR_ATIVO || g_hud.neural == NR_INICIANDO);
-                const bool camadaOn = C.overlay ? !bypass : true;
-                const bool tudoOn   = camadaOn && (neuralOn || !temAddon);
-                if (!tudoOn && !verificaNeuralAte) {   // vai LIGAR: arma a contagem em vez de ligar
-                    g_hud.ativarEm = ag + 3000;
-                    ShowToast(hi, C.mon, T(L"DLSS 5 ATIVANDO…  3", L"DLSS 5 ACTIVATING…  3"), 1300);
-                    Hud::Refresh();
-                    cmd = 0;
-                }
             }
         }
         contagemConcluida = false;
@@ -33610,7 +33783,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
             // produto e o neural.
             if (g_antes.neural && !t.empty()) {
                 neuralAlvo = g_tudoDesligado ? 0 : 1;
-                verificaNeuralAte = GetTickCount64() + 2500;
+                verificaNeuralAte = GetTickCount64() + 250;
                 neuralEntregasAntes = entregasAntes;
                 neuralAnuncia = false;   // o cartaz do "FILTRO LIGADO/DESLIGADO" ja saiu
                 neuralCorrigiu = false;
@@ -35819,6 +35992,7 @@ L"Do you want to continue?");
         Filtros::Tick();
         Perfil::Tick();
         Selo2x::Tick(hi, hwnd);
+        TelemetriaHud::Tick(hi, hwnd);
         Laco::Marca("Hud/Perfil::Tick");
         // A CONTAGEM DE LIGAR NA TELA: "DLSS 5 ATIVANDO… 3, 2, 1" no cartaz do canto, um
         // numero por segundo, o botao do painel acompanha, e NO ZERO o DLSS 5 liga de verdade
@@ -39794,7 +39968,7 @@ L"Do you want to continue?");
                         religouPorSolto);
                     if (AlternarNeural()) {
                         neuralAlvo = 1;
-                        verificaNeuralAte = GetTickCount64() + 2500;
+                        verificaNeuralAte = GetTickCount64() + 250;
                         neuralEntregasAntes = rsbridge::NeuralDelivered();
                         neuralAnuncia = false;
                         neuralCorrigiu = false;
@@ -39981,10 +40155,17 @@ L"Do you want to continue?");
                            g_hud.telaNativo ? T(L" (nativo)", L" (native)") : L"");
             reg[63] = 0;
             wchar_t t[512];
-            _snwprintf(t, 512, T(L"%ls - %ls - %ux%u - %.1f fps%ls%ls   |  %ls: painel   %ls: liga/desliga tudo   F11: tela cheia",
-                                 L"%ls - %ls - %ux%u - %.1f fps%ls%ls   |  %ls: panel   %ls: everything on/off   F11: fullscreen"),
-                       APP_TITLE, srcName.c_str(), R.srcW, R.srcH, fps, warn, reg,
-                       TextoAtalho(AT_PAINEL).c_str(), TextoAtalho(AT_TUDO).c_str());
+            if (C.kind == SRC_CAMERA) {
+                _snwprintf(t, 512,
+                           L"%ls | USB IN: %ux%u @ %.1f FPS  ->  SAÍDA: %ux%u @ %.1f FPS [RTX 5080] | End: Painel  F6: DLSS  F10: OSD",
+                           APP_TITLE, R.srcW, R.srcH, (cap.fpsReal.load() > 0.1 ? cap.fpsReal.load() : fps),
+                           R.w, R.h, pfps);
+            } else {
+                _snwprintf(t, 512, T(L"%ls - %ls - %ux%u - %.1f fps%ls%ls   |  %ls: painel   %ls: liga/desliga tudo   F10: OSD   F11: tela cheia",
+                                     L"%ls - %ls - %ux%u - %.1f fps%ls%ls   |  %ls: panel   %ls: everything on/off   F10: OSD   F11: fullscreen"),
+                           APP_TITLE, srcName.c_str(), R.srcW, R.srcH, fps, warn, reg,
+                           TextoAtalho(AT_PAINEL).c_str(), TextoAtalho(AT_TUDO).c_str());
+            }
             t[511] = 0;
             SetWindowTextW(hwnd, t);
             Laco::Marca("titulo e avisos");
@@ -40090,6 +40271,7 @@ L"Do you want to continue?");
     Perfil::Close();
     Perfil::Shutdown();
     Selo2x::Shutdown();
+    TelemetriaHud::Shutdown();
     Hud::Close();
     Hud::Shutdown();
     Fundo::Fechar();   // o preto nao pode sobreviver ao app - seria uma tela preta sem dono

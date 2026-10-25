@@ -212,7 +212,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_NCHITTEST:    return HTCLIENT;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;   // o jogo continua com o foco
-    case WM_SETCURSOR:    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE;
+    case WM_SETCURSOR:    SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE;
     case WM_LBUTTONDOWN: {
         POINT c; GetCursorPos(&c);
         RECT img{};
@@ -257,7 +257,7 @@ static DWORD WINAPI Thread(void*) {
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hi;
-    wc.hCursor = LoadCursorW(nullptr, IDC_SIZEWE);
+    wc.hCursor = LoadCursor(nullptr, IDC_SIZEWE);
     wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     wc.lpszClassName = kClasse;
     RegisterClassExW(&wc);

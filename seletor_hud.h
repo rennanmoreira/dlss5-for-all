@@ -2389,7 +2389,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (LOWORD(lp) == HTCLIENT) {
             POINT p{}; GetCursorPos(&p); ScreenToClient(h, &p);
             const int hit = HitTest(p);
-            SetCursor(LoadCursorW(nullptr, (hit >= 0 && g_it[hit].enabled) ? IDC_HAND : NoTopo(p) ? IDC_SIZEALL : IDC_ARROW));
+            SetCursor(LoadCursor(nullptr, (hit >= 0 && g_it[hit].enabled) ? IDC_HAND : NoTopo(p) ? IDC_SIZEALL : IDC_ARROW));
             return TRUE;
         }
         break;

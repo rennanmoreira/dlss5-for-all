@@ -9,6 +9,7 @@
 *.addon64
 *.o
 *.obj
+*.res
 *.res.o
 *.lib
 *.a
@@ -54,6 +55,7 @@ DLSS5 Screenshots/
 # As alterações locais sobre ele estão registradas em
 # feeder-amd/patches-feeder-amd.diff, que ESTE repositório versiona.
 feeder-amd/src-feeder/
+!feeder-amd/src-feeder/src/feed_fsr1.h
 
 # --- Lixo do Windows -------------------------------------------------------
 Thumbs.db
